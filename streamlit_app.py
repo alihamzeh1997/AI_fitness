@@ -8,9 +8,15 @@ from PIL import Image
 import tempfile
 import math
 import time
+import toml
 from decord import VideoReader
 import base64
 from io import BytesIO
+import gdown
+from pydrive.auth import GoogleAuth
+from pydrive.drive import GoogleDrive
+from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request
 
 # Set page config
 st.set_page_config(
@@ -31,14 +37,66 @@ def install_required_packages():
     try:
         import google.generativeai
         import decord
+        import pydrive
+        import gdown
     except ImportError:
-        os.system("pip install google-generativeai Pillow matplotlib opencv-python decord")
+        os.system("pip install google-generativeai Pillow matplotlib opencv-python decord pydrive2 gdown")
 
 # Attempt to install packages if in a supported environment
 try:
     install_required_packages()
 except:
     st.warning("Unable to automatically install required packages. If you encounter errors, please install manually.")
+
+# Load default configuration from toml file
+@st.cache_resource
+def load_config():
+    try:
+        if os.path.exists("config.toml"):
+            return toml.load("config.toml")
+        else:
+            return {"gemini_api_key": "", "google_drive_credentials": {}}
+    except Exception as e:
+        st.error(f"Error loading configuration: {e}")
+        return {"gemini_api_key": "", "google_drive_credentials": {}}
+
+config = load_config()
+
+# Google Drive Authentication
+def authenticate_google_drive(service_account_info=None):
+    """Authenticate with Google Drive using service account or OAuth."""
+    try:
+        if service_account_info:
+            # Use service account
+            credentials = Credentials.from_service_account_info(
+                service_account_info,
+                scopes=['https://www.googleapis.com/auth/drive']
+            )
+            drive = GoogleDrive(credentials)
+            return drive
+        else:
+            # Use OAuth flow
+            gauth = GoogleAuth()
+            gauth.LocalWebserverAuth()  # Creates local webserver and auto handles authentication
+            drive = GoogleDrive(gauth)
+            return drive
+    except Exception as e:
+        st.error(f"Error authenticating with Google Drive: {e}")
+        return None
+
+# Upload file to Google Drive
+def upload_to_drive(drive, file_path, folder_id=None):
+    """Upload file to Google Drive and return file ID."""
+    try:
+        file_drive = drive.CreateFile({'title': os.path.basename(file_path)})
+        if folder_id:
+            file_drive['parents'] = [{'id': folder_id}]
+        file_drive.SetContentFile(file_path)
+        file_drive.Upload()
+        return file_drive['id']
+    except Exception as e:
+        st.error(f"Error uploading to Google Drive: {e}")
+        return None
 
 # Resize frame function
 def smart_resize(frame, min_dim=300, max_dim=400):
@@ -56,10 +114,11 @@ def draw_timestamp(frame, timestamp):
     cv2.putText(frame, text, (5, 20), font, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
     return frame
 
-def extract_frames(video_path, fps=4, min_dim=300, max_dim=400):
+def extract_frames(video_path, fps=4, min_dim=300, max_dim=400, use_gdrive=False, drive=None, folder_id=None):
     """
     Extracts N frames per second, resizes them smartly, and adds timestamps.
     Returns individual frames instead of a grid.
+    Can optionally save to Google Drive.
     """
     vr = VideoReader(video_path)
     video_fps = vr.get_avg_fps()
@@ -69,27 +128,40 @@ def extract_frames(video_path, fps=4, min_dim=300, max_dim=400):
     
     frames_with_timestamps = []
     
-    for sec in range(total_seconds):
-        for i in range(fps):
-            timestamp = sec + i / fps
-            frame_index = int(timestamp * video_fps)
-            if frame_index < num_frames:
-                frame = vr[frame_index].asnumpy()
-                frame = smart_resize(frame, min_dim, max_dim)
-                frame = draw_timestamp(frame, timestamp)
-                frames_with_timestamps.append((timestamp, frame))
+    # Create temporary directory for frames
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for sec in range(total_seconds):
+            for i in range(fps):
+                timestamp = sec + i / fps
+                frame_index = int(timestamp * video_fps)
+                if frame_index < num_frames:
+                    frame = vr[frame_index].asnumpy()
+                    frame = smart_resize(frame, min_dim, max_dim)
+                    frame = draw_timestamp(frame, timestamp)
+                    
+                    # Save frame locally
+                    frame_filename = f"frame_{sec}_{i}_{timestamp:.2f}.jpg"
+                    frame_path = os.path.join(tmpdir, frame_filename)
+                    cv2.imwrite(frame_path, frame)
+                    
+                    # If using Google Drive, upload frame
+                    if use_gdrive and drive:
+                        file_id = upload_to_drive(drive, frame_path, folder_id)
+                        frames_with_timestamps.append((timestamp, frame_path, file_id))
+                    else:
+                        frames_with_timestamps.append((timestamp, frame_path))
     
-    return frames_with_timestamps  # List of tuples: (timestamp, frame)
+    return frames_with_timestamps
 
-def setup_gemini_api(api_key, model_name):
+def setup_gemini_api(api_key, model_name, temperature=0.1, top_p=0.1, top_k=1):
     """Set up and return the Gemini model using provided API key and model name."""
     genai.configure(api_key=api_key)
 
-    # Set up the model
+    # Set up the model with user-configurable parameters
     generation_config = {
-        "temperature": 0.1,
-        "top_p": 0.1,
-        "top_k": 1,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
     }
 
     # Use the user-selected model
@@ -100,7 +172,8 @@ def setup_gemini_api(api_key, model_name):
 
     return model
 
-def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4, progress_bar=None):
+def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4, progress_bar=None, 
+                                         use_gdrive=False, drive=None, folder_id=None):
     """Analyze video frames using Gemini AI and return response."""
     # Role definition
     Role = (
@@ -176,10 +249,19 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
     Content.append(Role)
     Content.append(TaskPrompt)
 
-    # Extract frames
+    # Extract frames and optionally save to Google Drive
     with tempfile.TemporaryDirectory() as tmpdir:
-        frame_paths = []
-        frames = extract_frames(video_path, fps=frames_per_second)
+        if progress_bar:
+            progress_bar.progress(0.1, text="Extracting frames...")
+            
+        # Extract frames with optional Google Drive storage
+        frames = extract_frames(
+            video_path, 
+            fps=frames_per_second, 
+            use_gdrive=use_gdrive, 
+            drive=drive, 
+            folder_id=folder_id
+        )
         
         if progress_bar:
             progress_bar.progress(0.2, text="Frames extracted. Processing...")
@@ -188,14 +270,15 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
         max_frames = min(len(frames), 32)  # Limit to prevent exceeding API context
         frames = frames[:max_frames]
         
-        for i, (timestamp, frame) in enumerate(frames):
-            frame_path = os.path.join(tmpdir, f"frame_{i:04d}_{timestamp:.2f}.jpg")
-            cv2.imwrite(frame_path, frame)
-            frame_paths.append((timestamp, frame_path))
-
-        # Add frames to content with timestamps
-        for i, (timestamp, path) in enumerate(frame_paths):
-            img = Image.open(path)
+        # Process frames - different handling for GDrive vs local
+        for i, frame_data in enumerate(frames):
+            if use_gdrive and drive:
+                timestamp, frame_path, file_id = frame_data
+                img = Image.open(frame_path)
+            else:
+                timestamp, frame_path = frame_data
+                img = Image.open(frame_path)
+                
             Content.append(img)
             Content.append(
                 f"Frame {i+1}: This frame is at timestamp {timestamp:.2f} seconds of the video. "
@@ -203,8 +286,8 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
             )
             
             if progress_bar and i % 4 == 0:
-                progress_bar.progress(0.2 + 0.4 * (i / len(frame_paths)), 
-                                    text=f"Processing frame {i+1}/{len(frame_paths)}...")
+                progress_bar.progress(0.2 + 0.4 * (i / len(frames)), 
+                                    text=f"Processing frame {i+1}/{len(frames)}...")
 
     # Add output instructions
     Content.append(OutputFormat)
@@ -224,10 +307,34 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
             progress_bar.progress(1.0, text="Error occurred during analysis")
         return error_msg, Content
 
-# Sidebar for API key input and model selection
+# Create a folder in Google Drive
+def create_drive_folder(drive, folder_name="Fitness_Video_Analysis"):
+    """Create a folder in Google Drive and return its ID."""
+    try:
+        folder = drive.CreateFile({
+            'title': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        })
+        folder.Upload()
+        return folder['id']
+    except Exception as e:
+        st.error(f"Error creating Google Drive folder: {e}")
+        return None
+
+# Sidebar for configuration
 with st.sidebar:
     st.header("Configuration")
-    api_key = st.text_input("Enter your Gemini API Key", type="password")
+    
+    # API Key Configuration
+    st.subheader("API Key Settings")
+    use_default_key = st.checkbox("Use default API key from config", 
+                                value=True if config.get("gemini_api_key") else False)
+    
+    if use_default_key and config.get("gemini_api_key"):
+        api_key = config.get("gemini_api_key")
+        st.success("Using default API key from config.toml")
+    else:
+        api_key = st.text_input("Enter your Gemini API Key", type="password")
     
     # Model selection
     st.subheader("Select Gemini Model")
@@ -244,17 +351,35 @@ with st.sidebar:
         format_func=lambda x: model_options[x]
     )
     
+    # Advanced settings
+    st.subheader("Advanced Settings")
+    with st.expander("Model Parameters"):
+        temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.1, step=0.1,
+                             help="Higher values make output more random, lower values more deterministic")
+        top_p = st.slider("Top P", min_value=0.0, max_value=1.0, value=0.1, step=0.1,
+                       help="Controls diversity via nucleus sampling")
+        top_k = st.slider("Top K", min_value=1, max_value=40, value=1,
+                       help="Controls diversity by limiting to top k tokens")
+    
     frames_per_second = st.slider("Frames per second to extract", min_value=1, max_value=8, value=4)
     st.caption("Higher FPS gives more detailed analysis but takes longer to process")
+    
+    # Storage options
+    st.subheader("Storage Options")
+    use_gdrive = st.checkbox("Use Google Drive for frame storage", value=False)
+    if use_gdrive:
+        st.info("You'll need to authenticate with Google Drive when processing")
+        gdrive_folder_name = st.text_input("Google Drive folder name", value="Fitness_Video_Analysis")
     
     st.markdown("---")
     st.markdown("""
     ### How to use
-    1. Enter your Gemini API key in the sidebar
+    1. Choose API key option
     2. Select your preferred Gemini model
-    3. Upload a fitness video
-    4. Click "Analyze Video"
-    5. View AI analysis results
+    3. Adjust parameters if needed
+    4. Upload a fitness video
+    5. Click "Analyze Video"
+    6. View AI analysis results
     """)
     
     st.markdown("---")
@@ -282,6 +407,11 @@ if uploaded_file is not None:
     with st.expander("Video Analysis Details", expanded=False):
         st.write(f"Selected model: **{model_options[selected_model]}**")
         st.write(f"Frame extraction rate: **{frames_per_second} frames per second**")
+        st.write(f"Temperature: **{temperature}**")
+        st.write(f"Top P: **{top_p}**")
+        st.write(f"Top K: **{top_k}**")
+        st.write(f"Using Google Drive: **{'Yes' if use_gdrive else 'No'}**")
+        
         vr = VideoReader(temp_file_path)
         video_fps = vr.get_avg_fps()
         num_frames = len(vr)
@@ -292,22 +422,38 @@ if uploaded_file is not None:
     # Analyze button
     if st.button("Analyze Video"):
         if not api_key:
-            st.error("Please enter your Gemini API key in the sidebar.")
+            st.error("Please enter your Gemini API key in the sidebar or ensure a default key is in config.toml.")
         else:
             try:
                 # Create progress bar
                 progress_text = "Starting analysis..."
                 progress_bar = st.progress(0, text=progress_text)
                 
-                # Setup model with API key and selected model
-                model = setup_gemini_api(api_key, selected_model)
+                # Initialize Google Drive if selected
+                drive = None
+                folder_id = None
+                if use_gdrive:
+                    progress_bar.progress(0.05, text="Authenticating with Google Drive...")
+                    drive = authenticate_google_drive(config.get("google_drive_credentials"))
+                    if drive:
+                        folder_id = create_drive_folder(drive, gdrive_folder_name)
+                        if folder_id:
+                            st.success(f"Created folder in Google Drive: {gdrive_folder_name}")
+                        else:
+                            st.warning("Couldn't create Google Drive folder. Using local storage instead.")
+                            use_gdrive = False
+                    else:
+                        st.warning("Google Drive authentication failed. Using local storage instead.")
+                        use_gdrive = False
                 
-                # Extract frames in the background (no display)
-                progress_bar.progress(0.1, text="Extracting frames...")
+                # Setup model with API key and selected model
+                model = setup_gemini_api(api_key, selected_model, temperature, top_p, top_k)
                 
                 # Analyze with Gemini
                 analysis_result, _ = analyze_with_gemini_individual_frames(
-                    model, temp_file_path, frames_per_second, progress_bar)
+                    model, temp_file_path, frames_per_second, progress_bar,
+                    use_gdrive=use_gdrive, drive=drive, folder_id=folder_id
+                )
                 
                 # Display results
                 st.subheader("AI Analysis Results")
@@ -315,6 +461,10 @@ if uploaded_file is not None:
                 
                 # Complete progress
                 progress_bar.progress(1.0, text="Analysis complete!")
+                
+                # Provide link to Google Drive folder if used
+                if use_gdrive and folder_id:
+                    st.info(f"Frame images stored in Google Drive folder: {gdrive_folder_name}")
                 
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
