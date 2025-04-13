@@ -81,8 +81,8 @@ def extract_frames(video_path, fps=4, min_dim=300, max_dim=400):
     
     return frames_with_timestamps  # List of tuples: (timestamp, frame)
 
-def setup_gemini_api(api_key):
-    """Set up and return the Gemini model using provided API key."""
+def setup_gemini_api(api_key, model_name):
+    """Set up and return the Gemini model using provided API key and model name."""
     genai.configure(api_key=api_key)
 
     # Set up the model
@@ -92,9 +92,9 @@ def setup_gemini_api(api_key):
         "top_k": 1,
     }
 
-    # Using Gemini Pro as default model
+    # Use the user-selected model
     model = genai.GenerativeModel(
-        model_name="gemini-pro-vision",  # Use available model
+        model_name=model_name,
         generation_config=generation_config
     )
 
@@ -204,7 +204,7 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
             
             if progress_bar and i % 4 == 0:
                 progress_bar.progress(0.2 + 0.4 * (i / len(frame_paths)), 
-                                     text=f"Processing frame {i+1}/{len(frame_paths)}...")
+                                    text=f"Processing frame {i+1}/{len(frame_paths)}...")
 
     # Add output instructions
     Content.append(OutputFormat)
@@ -224,34 +224,26 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
             progress_bar.progress(1.0, text="Error occurred during analysis")
         return error_msg, Content
 
-def pil_to_base64(image):
-    """Convert PIL image to base64 string for displaying in HTML."""
-    buffered = BytesIO()
-    image.save(buffered, format="JPEG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    return img_str
-
-def display_frames_gallery(frames_with_timestamps, num_cols=4):
-    """Display extracted frames in a gallery view."""
-    cols = st.columns(num_cols)
-    
-    for i, (timestamp, frame) in enumerate(frames_with_timestamps):
-        with cols[i % num_cols]:
-            # Convert BGR to RGB for display
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb_frame)
-            st.image(pil_img, caption=f"Time: {timestamp:.2f}s", use_column_width=True)
-            
-            # Limit display to 16 frames to prevent UI crowding
-            if i >= 15:  
-                with cols[(i+1) % num_cols]:
-                    st.caption("... more frames available but not displayed")
-                break
-
-# Sidebar for API key input
+# Sidebar for API key input and model selection
 with st.sidebar:
     st.header("Configuration")
     api_key = st.text_input("Enter your Gemini API Key", type="password")
+    
+    # Model selection
+    st.subheader("Select Gemini Model")
+    model_options = {
+        "gemini-pro-vision": "Gemini Pro Vision",
+        "gemini-1.5-pro-vision": "Gemini 1.5 Pro Vision",
+        "gemini-1.5-flash-vision": "Gemini 1.5 Flash Vision",
+        "gemini-2.0-pro-vision": "Gemini 2.0 Pro Vision (if available)",
+        "gemini-2.5-pro-exp-03-25": "Gemini 2.5 Pro Experimental"
+    }
+    selected_model = st.selectbox(
+        "Choose a model",
+        list(model_options.keys()),
+        format_func=lambda x: model_options[x]
+    )
+    
     frames_per_second = st.slider("Frames per second to extract", min_value=1, max_value=8, value=4)
     st.caption("Higher FPS gives more detailed analysis but takes longer to process")
     
@@ -259,9 +251,10 @@ with st.sidebar:
     st.markdown("""
     ### How to use
     1. Enter your Gemini API key in the sidebar
-    2. Upload a fitness video
-    3. Click "Analyze Video"
-    4. View AI analysis results
+    2. Select your preferred Gemini model
+    3. Upload a fitness video
+    4. Click "Analyze Video"
+    5. View AI analysis results
     """)
     
     st.markdown("---")
@@ -285,6 +278,17 @@ if uploaded_file is not None:
     # Display the video
     st.video(temp_file_path)
     
+    # Analysis section with collapsible details
+    with st.expander("Video Analysis Details", expanded=False):
+        st.write(f"Selected model: **{model_options[selected_model]}**")
+        st.write(f"Frame extraction rate: **{frames_per_second} frames per second**")
+        vr = VideoReader(temp_file_path)
+        video_fps = vr.get_avg_fps()
+        num_frames = len(vr)
+        duration = num_frames / video_fps
+        st.write(f"Video duration: **{duration:.2f} seconds**")
+        st.write(f"Original video FPS: **{video_fps:.2f}**")
+    
     # Analyze button
     if st.button("Analyze Video"):
         if not api_key:
@@ -295,17 +299,11 @@ if uploaded_file is not None:
                 progress_text = "Starting analysis..."
                 progress_bar = st.progress(0, text=progress_text)
                 
-                # Setup model with API key
-                model = setup_gemini_api(api_key)
+                # Setup model with API key and selected model
+                model = setup_gemini_api(api_key, selected_model)
                 
-                # Extract some frames to display
+                # Extract frames in the background (no display)
                 progress_bar.progress(0.1, text="Extracting frames...")
-                frames = extract_frames(temp_file_path, fps=frames_per_second)
-                
-                # Display a sample of extracted frames
-                st.subheader("Sample of Extracted Frames")
-                sample_frames = frames[:min(16, len(frames))]
-                display_frames_gallery(sample_frames)
                 
                 # Analyze with Gemini
                 analysis_result, _ = analyze_with_gemini_individual_frames(
