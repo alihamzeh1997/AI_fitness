@@ -2,7 +2,6 @@ import streamlit as st
 import os
 import cv2
 import numpy as np
-import google.generativeai as genai
 import matplotlib.pyplot as plt
 from PIL import Image
 import tempfile
@@ -11,6 +10,7 @@ import time
 from decord import VideoReader
 import base64
 from io import BytesIO
+from openai import OpenAI
 
 # Set page config
 st.set_page_config(
@@ -29,10 +29,10 @@ Simply upload a video of your workout, and our AI will provide detailed feedback
 # Function to install required packages (for notebook environments)
 def install_required_packages():
     try:
-        import google.generativeai
+        import openai
         import decord
     except ImportError:
-        os.system("pip install google-generativeai Pillow matplotlib opencv-python decord")
+        os.system("pip install openai Pillow matplotlib opencv-python decord")
 
 # Attempt to install packages if in a supported environment
 try:
@@ -81,33 +81,27 @@ def extract_frames(video_path, fps=4, min_dim=300, max_dim=400):
     
     return frames_with_timestamps  # List of tuples: (timestamp, frame)
 
-def setup_gemini_api(api_key, model_name):
-    """Set up and return the Gemini model using provided API key and model name."""
-    genai.configure(api_key=api_key)
+def image_to_base64(image):
+    """Convert a PIL image to base64 string."""
+    buffered = BytesIO()
+    image.save(buffered, format="JPEG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-    # Set up the model
-    generation_config = {
-        "temperature": 0.1,
-        "top_p": 0.1,
-        "top_k": 1,
-    }
-
-    # Use the user-selected model
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        generation_config=generation_config
+def setup_openrouter_client(api_key):
+    """Set up and return the OpenRouter client using provided API key."""
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
     )
+    return client
 
-    return model
-
-def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4, progress_bar=None):
-    """Analyze video frames using Gemini AI and return response."""
+def analyze_with_openrouter(client, model_name, video_path, frames_per_second=4, progress_bar=None):
+    """Analyze video frames using OpenRouter AI and return response."""
     # Role definition
-    Role = (
+    role_prompt = (
         "You're a fitness expert and your task is to analyze fitness videos. "
         "You need to be aware of the user's movement during the sequence of frames extracted from the video. "
         "Each frame is annotated with the timestamp showing its exact position in the video."
-        "Write shortly"
     )
 
     # Get total duration from video using Decord
@@ -117,7 +111,7 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
     total_duration_sec = round(num_frames / video_fps)
 
     # Task prompt with total video time
-    TaskPrompt = (
+    task_prompt = (
         f"You will be given a sequence of individual frames extracted from a fitness video. "
         f"The total duration of the video is approximately {total_duration_sec} seconds. "
         f"I'm showing you {frames_per_second} frames per second, and every frame is annotated with a timestamp showing its exact position in the video.\n\n"
@@ -161,7 +155,7 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
     )
 
     # Output format
-    OutputFormat = (
+    output_format = (
         "Please respond in this format:\n"
         "- Exercise identified:\n"
         "- Total repetition count (Detailed with timestamp):\n"
@@ -170,79 +164,112 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
         "- Reasoning for your analysis:"
     )
 
-    Content = []
-    
-    # Add role and task prompt
-    Content.append(Role)
-    Content.append(TaskPrompt)
-
     # Extract frames
     with tempfile.TemporaryDirectory() as tmpdir:
-        frame_paths = []
         frames = extract_frames(video_path, fps=frames_per_second)
         
         if progress_bar:
             progress_bar.progress(0.2, text="Frames extracted. Processing...")
 
         # Maximum number of frames to process (adjust based on model limits)
-        max_frames = min(len(frames), 64)  # Limit to prevent exceeding API context
+        max_frames = min(len(frames), 20)  # Limit to prevent exceeding API context
         frames = frames[:max_frames]
         
+        # Prepare message content
+        message_content = [
+            {
+                "type": "text",
+                "text": f"{role_prompt}\n\n{task_prompt}\n\n{output_format}"
+            }
+        ]
+        
+        frame_descriptions = []
+        
+        # Process frames
         for i, (timestamp, frame) in enumerate(frames):
             frame_path = os.path.join(tmpdir, f"frame_{i:04d}_{timestamp:.2f}.jpg")
             cv2.imwrite(frame_path, frame)
-            frame_paths.append((timestamp, frame_path))
-
-        # Add frames to content with timestamps
-        for i, (timestamp, path) in enumerate(frame_paths):
-            img = Image.open(path)
-            Content.append(img)
-            Content.append(
-                f"Frame {i+1}: This frame is at timestamp {timestamp:.2f} seconds of the video. "
-                f"Please analyze this frame in the context of the sequence."
-            )
+            
+            # Convert OpenCV image to PIL Image
+            img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            
+            # Convert image to base64 string
+            img_base64 = image_to_base64(img_pil)
+            
+            # Add frame to message content
+            message_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{img_base64}"
+                }
+            })
+            
+            # Add description text for each frame
+            frame_description = f"Frame {i+1}: This frame is at timestamp {timestamp:.2f} seconds of the video."
+            frame_descriptions.append(frame_description)
             
             if progress_bar and i % 4 == 0:
-                progress_bar.progress(0.2 + 0.4 * (i / len(frame_paths)), 
-                                    text=f"Processing frame {i+1}/{len(frame_paths)}...")
-
-    # Add output instructions
-    Content.append(OutputFormat)
+                progress_bar.progress(0.2 + 0.4 * (i / len(frames)), 
+                                    text=f"Processing frame {i+1}/{len(frames)}...")
+        
+        # Add frame descriptions as a single text block after all images
+        message_content.append({
+            "type": "text",
+            "text": "\n".join(frame_descriptions)
+        })
     
     if progress_bar:
         progress_bar.progress(0.6, text="Sending to AI for analysis...")
 
-    # Analyze with Gemini
+    # Analyze with OpenRouter
     try:
-        response = model.generate_content(Content)
+        completion = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "user",
+                    "content": message_content
+                }
+            ]
+        )
         if progress_bar:
             progress_bar.progress(0.9, text="Analysis complete! Preparing results...")
-        return response.text, Content
+        return completion.choices[0].message.content
     except Exception as e:
-        error_msg = f"Error analyzing with Gemini: {str(e)}"
+        error_msg = f"Error analyzing with OpenRouter: {str(e)}"
         if progress_bar:
             progress_bar.progress(1.0, text="Error occurred during analysis")
-        return error_msg, Content
+        return error_msg
 
 # Sidebar for API key input and model selection
 with st.sidebar:
     st.header("Configuration")
-    api_key = st.text_input("Enter your Gemini API Key", type="password")
+    api_key = st.text_input("Enter your OpenRouter API Key", type="password")
     
     # Model selection
-    st.subheader("Select Gemini Model")
+    st.subheader("Select Vision Model")
     model_options = {
-        "gemini-pro-vision": "Gemini Pro Vision",
-        "gemini-1.5-pro-vision": "Gemini 1.5 Pro Vision",
-        "gemini-1.5-flash-vision": "Gemini 1.5 Flash Vision",
-        "gemini-2.0-pro-vision": "Gemini 2.0 Pro Vision (if available)",
-        "gemini-2.5-pro-exp-03-25": "Gemini 2.5 Pro Experimental"
+        "meta-llama/llama-4-scout:free": "Llama 4 Scout (Free)",
+        "anthropic/claude-3-5-sonnet": "Claude 3.5 Sonnet",
+        "anthropic/claude-3-opus": "Claude 3 Opus",
+        "google/gemini-1.5-pro": "Gemini 1.5 Pro",
+        "perplexity/sonar-large": "Perplexity Sonar Large",
+        "mistralai/mistral-large": "Mistral Large",
+        "gpt-4o": "GPT-4o",
+        "custom": "Custom Model ID"
     }
+    
     selected_model = st.selectbox(
         "Choose a model",
         list(model_options.keys()),
         format_func=lambda x: model_options[x]
     )
+    
+    # Custom model input
+    if selected_model == "custom":
+        custom_model = st.text_input("Enter custom model ID")
+        if custom_model:
+            selected_model = custom_model
     
     frames_per_second = st.slider("Frames per second to extract", min_value=1, max_value=8, value=4)
     st.caption("Higher FPS gives more detailed analysis but takes longer to process")
@@ -250,8 +277,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("""
     ### How to use
-    1. Enter your Gemini API key in the sidebar
-    2. Select your preferred Gemini model
+    1. Enter your OpenRouter API key in the sidebar
+    2. Select your preferred model
     3. Upload a fitness video
     4. Click "Analyze Video"
     5. View AI analysis results
@@ -260,8 +287,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### About")
     st.markdown("""
-    This app uses Google's Gemini AI to analyze fitness videos.
-    It extracts frames from your video and sends them to the AI model
+    This app uses OpenRouter.ai to analyze fitness videos.
+    It extracts frames from your video and sends them to the selected AI model
     for detailed exercise analysis.
     """)
 
@@ -280,7 +307,8 @@ if uploaded_file is not None:
     
     # Analysis section with collapsible details
     with st.expander("Video Analysis Details", expanded=False):
-        st.write(f"Selected model: **{model_options[selected_model]}**")
+        model_display_name = model_options.get(selected_model, selected_model)
+        st.write(f"Selected model: **{model_display_name}**")
         st.write(f"Frame extraction rate: **{frames_per_second} frames per second**")
         vr = VideoReader(temp_file_path)
         video_fps = vr.get_avg_fps()
@@ -292,22 +320,22 @@ if uploaded_file is not None:
     # Analyze button
     if st.button("Analyze Video"):
         if not api_key:
-            st.error("Please enter your Gemini API key in the sidebar.")
+            st.error("Please enter your OpenRouter API key in the sidebar.")
         else:
             try:
                 # Create progress bar
                 progress_text = "Starting analysis..."
                 progress_bar = st.progress(0, text=progress_text)
                 
-                # Setup model with API key and selected model
-                model = setup_gemini_api(api_key, selected_model)
+                # Setup client with API key
+                client = setup_openrouter_client(api_key)
                 
                 # Extract frames in the background (no display)
                 progress_bar.progress(0.1, text="Extracting frames...")
                 
-                # Analyze with Gemini
-                analysis_result, _ = analyze_with_gemini_individual_frames(
-                    model, temp_file_path, frames_per_second, progress_bar)
+                # Analyze with OpenRouter
+                analysis_result = analyze_with_openrouter(
+                    client, selected_model, temp_file_path, frames_per_second, progress_bar)
                 
                 # Display results
                 st.subheader("AI Analysis Results")
@@ -359,4 +387,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.caption("AI Fitness Video Analyzer | Powered by Gemini AI")
+st.caption("AI Fitness Video Analyzer | Powered by OpenRouter.ai")
