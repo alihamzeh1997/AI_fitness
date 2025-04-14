@@ -385,6 +385,7 @@ else:
           Analysis based on tracking hip and knee angles across timestamps. The exercise was identified as a bodyweight squat based on the characteristic downward/upward movement pattern with weight on both legs. Repetitions were counted by identifying the starting position (standing tall) and tracking the full movement cycle back to that position. Form assessment considered knee tracking, torso angle, and depth of the squat.
         """)
 
+
 # Footer
 st.markdown("---")
 st.caption("AI Fitness Video Analyzer | Powered by OpenRouter.ai")
