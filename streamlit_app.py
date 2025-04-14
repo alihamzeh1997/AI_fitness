@@ -2,12 +2,15 @@ import streamlit as st
 import os
 import cv2
 import numpy as np
+import google.generativeai as genai
+import matplotlib.pyplot as plt
 from PIL import Image
 import tempfile
+import math
+import time
 from decord import VideoReader
 import base64
 from io import BytesIO
-from openai import OpenAI
 
 # Set page config
 st.set_page_config(
@@ -26,10 +29,10 @@ Simply upload a video of your workout, and our AI will provide detailed feedback
 # Function to install required packages (for notebook environments)
 def install_required_packages():
     try:
-        import openai
+        import google.generativeai
         import decord
     except ImportError:
-        os.system("pip install openai Pillow matplotlib opencv-python decord")
+        os.system("pip install google-generativeai Pillow matplotlib opencv-python decord")
 
 # Attempt to install packages if in a supported environment
 try:
@@ -78,207 +81,177 @@ def extract_frames(video_path, fps=4, min_dim=300, max_dim=400):
     
     return frames_with_timestamps  # List of tuples: (timestamp, frame)
 
-def image_to_base64(image):
-    """Convert a PIL image to base64 string."""
-    buffered = BytesIO()
-    image.save(buffered, format="JPEG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+def setup_gemini_api(api_key, model_name):
+    """Set up and return the Gemini model using provided API key and model name."""
+    genai.configure(api_key=api_key)
 
-def setup_openrouter_client(api_key):
-    """Set up and return the OpenRouter client using provided API key."""
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
+    # Set up the model
+    generation_config = {
+        "temperature": 0.1,
+        "top_p": 0.1,
+        "top_k": 1,
+    }
+
+    # Use the user-selected model
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        generation_config=generation_config
     )
-    return client
 
-def analyze_with_openrouter(client, model_name, video_path, frames_per_second=4, progress_bar=None):
-    """Analyze video frames using OpenRouter AI and return response."""
+    return model
+
+def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4, progress_bar=None):
+    """Analyze video frames using Gemini AI and return response."""
+    # Role definition
+    Role = (
+        "You're a fitness expert and your task is to analyze fitness videos. "
+        "You need to be aware of the user's movement during the sequence of frames extracted from the video. "
+        "Each frame is annotated with the timestamp showing its exact position in the video."
+        "Write shortly"
+    )
+
     # Get total duration from video using Decord
     vr = VideoReader(video_path)
     video_fps = vr.get_avg_fps()
     num_frames = len(vr)
     total_duration_sec = round(num_frames / video_fps)
-    
-    # Create main prompt with instructions
-    main_prompt = (
-        "You are a fitness expert analyzing a workout video. "
-        f"The video is approximately {total_duration_sec} seconds long. "
-        f"I'll show you {frames_per_second} frames per second with timestamps. "
-        "Your task is to:\n\n"
-        
-        "1. Identify the exercise being performed\n"
-        "2. Count repetitions with timestamps (start/end of each rep)\n"
-        "3. Assess tempo (slow/moderate/fast)\n"
-        "4. Evaluate form and technique\n\n"
-        
-        "Please be time-aware in your analysis, tracking movement across frames. "
-        "Identify complete repetitions only when the user returns to the starting position. "
-        "Note that rep speed may vary during the workout.\n\n"
-        
-        "I'll now show you the frames in sequence with their timestamps. "
-        "Please provide your analysis in this format:\n\n"
-        
+
+    # Task prompt with total video time
+    TaskPrompt = (
+        f"You will be given a sequence of individual frames extracted from a fitness video. "
+        f"The total duration of the video is approximately {total_duration_sec} seconds. "
+        f"I'm showing you {frames_per_second} frames per second, and every frame is annotated with a timestamp showing its exact position in the video.\n\n"
+
+        "Your task is to analyze the user's movement by reviewing the frames in order, with close attention to the timestamps. Your analysis must be time-aware, not just based on visual similarities.\n\n"
+
+        "The analysis consists of the following steps:\n\n"
+
+        "1. **Exercise Identification**:\n"
+        "- First, identify which exercise is being performed (e.g., squats, push-ups, lunges).\n"
+        "- Use full-body positioning, involved joints, angles, and movement patterns over time to determine the exercise type.\n"
+        "- Do not rely on the visual appearance of a single frame. Your identification must be based on how the user's body moves across time.\n\n"
+
+        "2. **Repetition Counting**:\n"
+        "- After identifying the exercise, determine when each repetition begins and ends.\n"
+        "- A repetition is only considered complete when the user returns to the starting position of the movement.\n"
+        "- It's especially important to correctly identify where in a rep the video starts — the beginning, middle, or end.\n"
+        "- To do this, go beyond visual comparison and conduct a **tempospatial analysis**: recognize which joints and body parts are involved in the exercise, then track their positioning and movement over time using timestamps.\n"
+        "- Compare body posture across frames and infer movement trajectories to accurately detect rep boundaries.\n"
+        "- Always look ahead to the next frames to confirm if a rep has truly ended. These are static frames sampled from a continuous video — temporal context is essential.\n"
+        "- Keep in mind that rep speed may vary during the workout. For example, the user might perform the first 3 reps at 2 seconds per rep, then slow down to 3 seconds or speed up to 1 second per rep.\n"
+        "- **Never assume a fixed tempo or repetition pattern based on earlier reps**. Each rep must be analyzed independently based on timestamped frames.\n\n"
+
+        "3. **Tempo Analysis**:\n"
+        "- For each repetition, calculate its duration using the frame timestamps.\n"
+        "- Categorize the tempo as slow, moderate, or fast based on time.\n"
+        "- If the user changes tempo across the session, explicitly highlight this change and explain when and how it happens.\n\n"
+
+        "4. **Form & Technique Evaluation**:\n"
+        "- Throughout the exercise, assess the user's form: body posture, joint alignment, range of motion, balance, and stability.\n"
+        "- Determine whether the user is performing the movement correctly, based on the standards of the identified exercise.\n"
+        "- Flag any issues such as incomplete movement, poor control, or risky alignment (e.g., knees going too far forward, rounded back, lack of full extension).\n\n"
+
+        "**Key Instructions:**\n"
+        "- Always refer to specific frames and timestamps when making observations.\n"
+        "- Your reasoning must be time-aware — describe how the user's position evolves across time.\n"
+        "- Avoid assumptions. If parts of the movement are unclear or missing from the video sample, explicitly state the limitations.\n"
+        "- Use clear biomechanical and fitness-specific terminology wherever appropriate.\n\n"
+
+        "Your response should reflect a detailed, timestamp-driven analysis of movement and should clearly tie all conclusions back to specific moments in the video."
+    )
+
+    # Output format
+    OutputFormat = (
+        "Please respond in this format:\n"
         "- Exercise identified:\n"
         "- Total repetition count (Detailed with timestamp):\n"
         "- Tempo assessment:\n"
         "- Form evaluation:\n"
         "- Reasoning for your analysis:"
     )
+
+    Content = []
     
+    # Add role and task prompt
+    Content.append(Role)
+    Content.append(TaskPrompt)
+
     # Extract frames
     with tempfile.TemporaryDirectory() as tmpdir:
+        frame_paths = []
         frames = extract_frames(video_path, fps=frames_per_second)
         
         if progress_bar:
             progress_bar.progress(0.2, text="Frames extracted. Processing...")
-        
-        # Limit frames to prevent API limits
-        max_frames = min(len(frames), 16)  # Adjust based on model limits
+
+        # Maximum number of frames to process (adjust based on model limits)
+        max_frames = min(len(frames), 32)  # Limit to prevent exceeding API context
         frames = frames[:max_frames]
         
-        # Prepare message content
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": main_prompt
-                    }
-                ]
-            }
-        ]
-        
-        # Process and add frames to the message
         for i, (timestamp, frame) in enumerate(frames):
-            # Process frame (convert to PIL, then to base64)
-            img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            img_base64 = image_to_base64(img_pil)
-            
-            # Create a message for each frame with its timestamp
-            frame_message = {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Frame {i+1} at timestamp {timestamp:.2f} seconds:"
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_base64}"
-                        }
-                    }
-                ]
-            }
-            
-            messages.append(frame_message)
+            frame_path = os.path.join(tmpdir, f"frame_{i:04d}_{timestamp:.2f}.jpg")
+            cv2.imwrite(frame_path, frame)
+            frame_paths.append((timestamp, frame_path))
+
+        # Add frames to content with timestamps
+        for i, (timestamp, path) in enumerate(frame_paths):
+            img = Image.open(path)
+            Content.append(img)
+            Content.append(
+                f"Frame {i+1}: This frame is at timestamp {timestamp:.2f} seconds of the video. "
+                f"Please analyze this frame in the context of the sequence."
+            )
             
             if progress_bar and i % 4 == 0:
-                progress_bar.progress(0.2 + 0.4 * (i / len(frames)), 
-                                    text=f"Processing frame {i+1}/{len(frames)}...")
-        
-        # Add final message requesting analysis
-        final_message = {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "Based on all frames shown above, please provide your complete fitness analysis following the format I specified earlier."
-                }
-            ]
-        }
-        messages.append(final_message)
+                progress_bar.progress(0.2 + 0.4 * (i / len(frame_paths)), 
+                                    text=f"Processing frame {i+1}/{len(frame_paths)}...")
+
+    # Add output instructions
+    Content.append(OutputFormat)
     
     if progress_bar:
         progress_bar.progress(0.6, text="Sending to AI for analysis...")
-    
-    # Try an alternative approach if there are too many separate messages
-    if len(messages) > 10:
-        # Reformat to a single message with combined content
-        combined_content = [{"type": "text", "text": main_prompt}]
-        
-        for i, (timestamp, frame) in enumerate(frames):
-            # Process frame
-            img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            img_base64 = image_to_base64(img_pil)
-            
-            # Add frame description
-            combined_content.append({"type": "text", "text": f"Frame {i+1} at timestamp {timestamp:.2f} seconds:"})
-            
-            # Add frame image
-            combined_content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{img_base64}"
-                }
-            })
-        
-        # Add final request
-        combined_content.append({"type": "text", "text": "Based on all frames shown above, please provide your complete fitness analysis following the format I specified earlier."})
-        
-        # Replace messages with single combined message
-        messages = [{
-            "role": "user",
-            "content": combined_content
-        }]
 
-    # Analyze with OpenRouter
+    # Analyze with Gemini
     try:
-        completion = client.chat.completions.create(
-            model=model_name,
-            messages=messages
-        )
+        response = model.generate_content(Content)
         if progress_bar:
             progress_bar.progress(0.9, text="Analysis complete! Preparing results...")
-        return completion.choices[0].message.content
+        return response.text, Content
     except Exception as e:
-        error_msg = f"Error analyzing with OpenRouter: {str(e)}"
+        error_msg = f"Error analyzing with Gemini: {str(e)}"
         if progress_bar:
             progress_bar.progress(1.0, text="Error occurred during analysis")
-        return error_msg
+        return error_msg, Content
 
 # Sidebar for API key input and model selection
 with st.sidebar:
     st.header("Configuration")
-    api_key = st.text_input("Enter your OpenRouter API Key", type="password")
+    api_key = st.text_input("Enter your Gemini API Key", type="password")
     
     # Model selection
-    st.subheader("Select Vision Model")
+    st.subheader("Select Gemini Model")
     model_options = {
-        "meta-llama/llama-4-vision": "Llama 4 Vision",
-        "anthropic/claude-3-5-sonnet-20240620": "Claude 3.5 Sonnet",
-        "anthropic/claude-3-opus-20240229": "Claude 3 Opus",
-        "google/gemini-1.5-pro-latest": "Gemini 1.5 Pro",
-        "openai/gpt-4o": "GPT-4o",
-        "mistralai/mistral-large-latest": "Mistral Large",
-        "custom": "Custom Model ID"
+        "gemini-pro-vision": "Gemini Pro Vision",
+        "gemini-1.5-pro-vision": "Gemini 1.5 Pro Vision",
+        "gemini-1.5-flash-vision": "Gemini 1.5 Flash Vision",
+        "gemini-2.0-pro-vision": "Gemini 2.0 Pro Vision (if available)",
+        "gemini-2.5-pro-exp-03-25": "Gemini 2.5 Pro Experimental"
     }
-    
     selected_model = st.selectbox(
         "Choose a model",
         list(model_options.keys()),
         format_func=lambda x: model_options[x]
     )
     
-    # Custom model input
-    if selected_model == "custom":
-        custom_model = st.text_input("Enter custom model ID")
-        if custom_model:
-            selected_model = custom_model
-    
     frames_per_second = st.slider("Frames per second to extract", min_value=1, max_value=8, value=4)
     st.caption("Higher FPS gives more detailed analysis but takes longer to process")
-    
-    # Token limit warning
-    st.warning("Vision models have token limits. If you get errors, try reducing the frames per second or using a model with higher limits.")
     
     st.markdown("---")
     st.markdown("""
     ### How to use
-    1. Enter your OpenRouter API key in the sidebar
-    2. Select your preferred model
+    1. Enter your Gemini API key in the sidebar
+    2. Select your preferred Gemini model
     3. Upload a fitness video
     4. Click "Analyze Video"
     5. View AI analysis results
@@ -287,8 +260,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### About")
     st.markdown("""
-    This app uses OpenRouter.ai to analyze fitness videos.
-    It extracts frames from your video and sends them to the selected AI model
+    This app uses Google's Gemini AI to analyze fitness videos.
+    It extracts frames from your video and sends them to the AI model
     for detailed exercise analysis.
     """)
 
@@ -307,8 +280,7 @@ if uploaded_file is not None:
     
     # Analysis section with collapsible details
     with st.expander("Video Analysis Details", expanded=False):
-        model_display_name = model_options.get(selected_model, selected_model)
-        st.write(f"Selected model: **{model_display_name}**")
+        st.write(f"Selected model: **{model_options[selected_model]}**")
         st.write(f"Frame extraction rate: **{frames_per_second} frames per second**")
         vr = VideoReader(temp_file_path)
         video_fps = vr.get_avg_fps()
@@ -320,22 +292,22 @@ if uploaded_file is not None:
     # Analyze button
     if st.button("Analyze Video"):
         if not api_key:
-            st.error("Please enter your OpenRouter API key in the sidebar.")
+            st.error("Please enter your Gemini API key in the sidebar.")
         else:
             try:
                 # Create progress bar
                 progress_text = "Starting analysis..."
                 progress_bar = st.progress(0, text=progress_text)
                 
-                # Setup client with API key
-                client = setup_openrouter_client(api_key)
+                # Setup model with API key and selected model
+                model = setup_gemini_api(api_key, selected_model)
                 
                 # Extract frames in the background (no display)
                 progress_bar.progress(0.1, text="Extracting frames...")
                 
-                # Analyze with OpenRouter
-                analysis_result = analyze_with_openrouter(
-                    client, selected_model, temp_file_path, frames_per_second, progress_bar)
+                # Analyze with Gemini
+                analysis_result, _ = analyze_with_gemini_individual_frames(
+                    model, temp_file_path, frames_per_second, progress_bar)
                 
                 # Display results
                 st.subheader("AI Analysis Results")
@@ -387,4 +359,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.caption("AI Fitness Video Analyzer | Powered by OpenRouter.ai")
+st.caption("AI Fitness Video Analyzer | Powered by Gemini AI")
