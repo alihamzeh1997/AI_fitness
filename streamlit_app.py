@@ -185,7 +185,7 @@ def analyze_with_gemini_individual_frames(model, video_path, frames_per_second=4
             progress_bar.progress(0.2, text="Frames extracted. Processing...")
 
         # Maximum number of frames to process (adjust based on model limits)
-        max_frames = min(len(frames), 32)  # Limit to prevent exceeding API context
+        max_frames = min(len(frames), 64)  # Limit to prevent exceeding API context
         frames = frames[:max_frames]
         
         for i, (timestamp, frame) in enumerate(frames):
