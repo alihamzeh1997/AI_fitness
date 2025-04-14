@@ -2,11 +2,8 @@ import streamlit as st
 import os
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 from PIL import Image
 import tempfile
-import math
-import time
 from decord import VideoReader
 import base64
 from io import BytesIO
@@ -97,140 +94,141 @@ def setup_openrouter_client(api_key):
 
 def analyze_with_openrouter(client, model_name, video_path, frames_per_second=4, progress_bar=None):
     """Analyze video frames using OpenRouter AI and return response."""
-    # Role definition
-    role_prompt = (
-        "You're a fitness expert and your task is to analyze fitness videos. "
-        "You need to be aware of the user's movement during the sequence of frames extracted from the video. "
-        "Each frame is annotated with the timestamp showing its exact position in the video."
-    )
-
     # Get total duration from video using Decord
     vr = VideoReader(video_path)
     video_fps = vr.get_avg_fps()
     num_frames = len(vr)
     total_duration_sec = round(num_frames / video_fps)
-
-    # Task prompt with total video time
-    task_prompt = (
-        f"You will be given a sequence of individual frames extracted from a fitness video. "
-        f"The total duration of the video is approximately {total_duration_sec} seconds. "
-        f"I'm showing you {frames_per_second} frames per second, and every frame is annotated with a timestamp showing its exact position in the video.\n\n"
-
-        "Your task is to analyze the user's movement by reviewing the frames in order, with close attention to the timestamps. Your analysis must be time-aware, not just based on visual similarities.\n\n"
-
-        "The analysis consists of the following steps:\n\n"
-
-        "1. **Exercise Identification**:\n"
-        "- First, identify which exercise is being performed (e.g., squats, push-ups, lunges).\n"
-        "- Use full-body positioning, involved joints, angles, and movement patterns over time to determine the exercise type.\n"
-        "- Do not rely on the visual appearance of a single frame. Your identification must be based on how the user's body moves across time.\n\n"
-
-        "2. **Repetition Counting**:\n"
-        "- After identifying the exercise, determine when each repetition begins and ends.\n"
-        "- A repetition is only considered complete when the user returns to the starting position of the movement.\n"
-        "- It's especially important to correctly identify where in a rep the video starts — the beginning, middle, or end.\n"
-        "- To do this, go beyond visual comparison and conduct a **tempospatial analysis**: recognize which joints and body parts are involved in the exercise, then track their positioning and movement over time using timestamps.\n"
-        "- Compare body posture across frames and infer movement trajectories to accurately detect rep boundaries.\n"
-        "- Always look ahead to the next frames to confirm if a rep has truly ended. These are static frames sampled from a continuous video — temporal context is essential.\n"
-        "- Keep in mind that rep speed may vary during the workout. For example, the user might perform the first 3 reps at 2 seconds per rep, then slow down to 3 seconds or speed up to 1 second per rep.\n"
-        "- **Never assume a fixed tempo or repetition pattern based on earlier reps**. Each rep must be analyzed independently based on timestamped frames.\n\n"
-
-        "3. **Tempo Analysis**:\n"
-        "- For each repetition, calculate its duration using the frame timestamps.\n"
-        "- Categorize the tempo as slow, moderate, or fast based on time.\n"
-        "- If the user changes tempo across the session, explicitly highlight this change and explain when and how it happens.\n\n"
-
-        "4. **Form & Technique Evaluation**:\n"
-        "- Throughout the exercise, assess the user's form: body posture, joint alignment, range of motion, balance, and stability.\n"
-        "- Determine whether the user is performing the movement correctly, based on the standards of the identified exercise.\n"
-        "- Flag any issues such as incomplete movement, poor control, or risky alignment (e.g., knees going too far forward, rounded back, lack of full extension).\n\n"
-
-        "**Key Instructions:**\n"
-        "- Always refer to specific frames and timestamps when making observations.\n"
-        "- Your reasoning must be time-aware — describe how the user's position evolves across time.\n"
-        "- Avoid assumptions. If parts of the movement are unclear or missing from the video sample, explicitly state the limitations.\n"
-        "- Use clear biomechanical and fitness-specific terminology wherever appropriate.\n\n"
-
-        "Your response should reflect a detailed, timestamp-driven analysis of movement and should clearly tie all conclusions back to specific moments in the video."
-    )
-
-    # Output format
-    output_format = (
-        "Please respond in this format:\n"
+    
+    # Create main prompt with instructions
+    main_prompt = (
+        "You are a fitness expert analyzing a workout video. "
+        f"The video is approximately {total_duration_sec} seconds long. "
+        f"I'll show you {frames_per_second} frames per second with timestamps. "
+        "Your task is to:\n\n"
+        
+        "1. Identify the exercise being performed\n"
+        "2. Count repetitions with timestamps (start/end of each rep)\n"
+        "3. Assess tempo (slow/moderate/fast)\n"
+        "4. Evaluate form and technique\n\n"
+        
+        "Please be time-aware in your analysis, tracking movement across frames. "
+        "Identify complete repetitions only when the user returns to the starting position. "
+        "Note that rep speed may vary during the workout.\n\n"
+        
+        "I'll now show you the frames in sequence with their timestamps. "
+        "Please provide your analysis in this format:\n\n"
+        
         "- Exercise identified:\n"
         "- Total repetition count (Detailed with timestamp):\n"
         "- Tempo assessment:\n"
         "- Form evaluation:\n"
         "- Reasoning for your analysis:"
     )
-
+    
     # Extract frames
     with tempfile.TemporaryDirectory() as tmpdir:
         frames = extract_frames(video_path, fps=frames_per_second)
         
         if progress_bar:
             progress_bar.progress(0.2, text="Frames extracted. Processing...")
-
-        # Maximum number of frames to process (adjust based on model limits)
-        max_frames = min(len(frames), 20)  # Limit to prevent exceeding API context
+        
+        # Limit frames to prevent API limits
+        max_frames = min(len(frames), 16)  # Adjust based on model limits
         frames = frames[:max_frames]
         
         # Prepare message content
-        message_content = [
+        messages = [
             {
-                "type": "text",
-                "text": f"{role_prompt}\n\n{task_prompt}\n\n{output_format}"
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": main_prompt
+                    }
+                ]
             }
         ]
         
-        frame_descriptions = []
-        
-        # Process frames
+        # Process and add frames to the message
         for i, (timestamp, frame) in enumerate(frames):
-            frame_path = os.path.join(tmpdir, f"frame_{i:04d}_{timestamp:.2f}.jpg")
-            cv2.imwrite(frame_path, frame)
-            
-            # Convert OpenCV image to PIL Image
+            # Process frame (convert to PIL, then to base64)
             img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            
-            # Convert image to base64 string
             img_base64 = image_to_base64(img_pil)
             
-            # Add frame to message content
-            message_content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{img_base64}"
-                }
-            })
+            # Create a message for each frame with its timestamp
+            frame_message = {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Frame {i+1} at timestamp {timestamp:.2f} seconds:"
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_base64}"
+                        }
+                    }
+                ]
+            }
             
-            # Add description text for each frame
-            frame_description = f"Frame {i+1}: This frame is at timestamp {timestamp:.2f} seconds of the video."
-            frame_descriptions.append(frame_description)
+            messages.append(frame_message)
             
             if progress_bar and i % 4 == 0:
                 progress_bar.progress(0.2 + 0.4 * (i / len(frames)), 
                                     text=f"Processing frame {i+1}/{len(frames)}...")
         
-        # Add frame descriptions as a single text block after all images
-        message_content.append({
-            "type": "text",
-            "text": "\n".join(frame_descriptions)
-        })
+        # Add final message requesting analysis
+        final_message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Based on all frames shown above, please provide your complete fitness analysis following the format I specified earlier."
+                }
+            ]
+        }
+        messages.append(final_message)
     
     if progress_bar:
         progress_bar.progress(0.6, text="Sending to AI for analysis...")
+    
+    # Try an alternative approach if there are too many separate messages
+    if len(messages) > 10:
+        # Reformat to a single message with combined content
+        combined_content = [{"type": "text", "text": main_prompt}]
+        
+        for i, (timestamp, frame) in enumerate(frames):
+            # Process frame
+            img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            img_base64 = image_to_base64(img_pil)
+            
+            # Add frame description
+            combined_content.append({"type": "text", "text": f"Frame {i+1} at timestamp {timestamp:.2f} seconds:"})
+            
+            # Add frame image
+            combined_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{img_base64}"
+                }
+            })
+        
+        # Add final request
+        combined_content.append({"type": "text", "text": "Based on all frames shown above, please provide your complete fitness analysis following the format I specified earlier."})
+        
+        # Replace messages with single combined message
+        messages = [{
+            "role": "user",
+            "content": combined_content
+        }]
 
     # Analyze with OpenRouter
     try:
         completion = client.chat.completions.create(
             model=model_name,
-            messages=[
-                {
-                    "role": "user",
-                    "content": message_content
-                }
-            ]
+            messages=messages
         )
         if progress_bar:
             progress_bar.progress(0.9, text="Analysis complete! Preparing results...")
@@ -249,13 +247,12 @@ with st.sidebar:
     # Model selection
     st.subheader("Select Vision Model")
     model_options = {
-        "meta-llama/llama-4-scout:free": "Llama 4 Scout (Free)",
-        "anthropic/claude-3-5-sonnet": "Claude 3.5 Sonnet",
-        "anthropic/claude-3-opus": "Claude 3 Opus",
-        "google/gemini-1.5-pro": "Gemini 1.5 Pro",
-        "perplexity/sonar-large": "Perplexity Sonar Large",
-        "mistralai/mistral-large": "Mistral Large",
-        "gpt-4o": "GPT-4o",
+        "meta-llama/llama-4-vision": "Llama 4 Vision",
+        "anthropic/claude-3-5-sonnet-20240620": "Claude 3.5 Sonnet",
+        "anthropic/claude-3-opus-20240229": "Claude 3 Opus",
+        "google/gemini-1.5-pro-latest": "Gemini 1.5 Pro",
+        "openai/gpt-4o": "GPT-4o",
+        "mistralai/mistral-large-latest": "Mistral Large",
         "custom": "Custom Model ID"
     }
     
@@ -273,6 +270,9 @@ with st.sidebar:
     
     frames_per_second = st.slider("Frames per second to extract", min_value=1, max_value=8, value=4)
     st.caption("Higher FPS gives more detailed analysis but takes longer to process")
+    
+    # Token limit warning
+    st.warning("Vision models have token limits. If you get errors, try reducing the frames per second or using a model with higher limits.")
     
     st.markdown("---")
     st.markdown("""
@@ -384,7 +384,6 @@ else:
         - **Reasoning for your analysis**:
           Analysis based on tracking hip and knee angles across timestamps. The exercise was identified as a bodyweight squat based on the characteristic downward/upward movement pattern with weight on both legs. Repetitions were counted by identifying the starting position (standing tall) and tracking the full movement cycle back to that position. Form assessment considered knee tracking, torso angle, and depth of the squat.
         """)
-
 
 # Footer
 st.markdown("---")
